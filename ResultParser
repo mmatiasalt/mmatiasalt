@@ -1,0 +1,70 @@
+import xml.etree.ElementTree as ET
+import os
+
+def extract_specific_ids_and_sizes(filepath):
+    """
+    Extracts IDs from an XML (CDA HL7 eCR) document that match the specified pattern,
+    calculates the size of related content, and provides a summary.
+    """
+
+    if not os.path.exists(filepath):
+        print(f"Error: File '{filepath}' not found.")
+        return {}
+
+    try:
+        tree = ET.parse(filepath)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        print(f"Error parsing XML: {e}")
+        return {}
+
+    extracted_data = {}
+    total_doc_size = os.path.getsize(filepath)
+
+    for element in root.iter():
+        if 'ID' in element.attrib and element.attrib['ID'].startswith("Result.1.2.840.114350.1.13.451.2.7.2."):
+            id_val = element.attrib['ID']
+            related_content = ET.tostring(element, encoding='utf-8').decode('utf-8')
+            content_size = len(related_content.encode('utf-8'))
+
+            code_system_original_text = None
+            code_system_display_name = None
+
+            code_element = element.find(".//cda:code", namespaces={'cda': 'urn:hl7-org:v3'})
+            if code_element is not None:
+                code_system_original_text = code_element.find(".//cda:originalText", namespaces={'cda': 'urn:hl7-org:v3'})
+                if code_system_original_text is not None and code_system_original_text.text is not None:
+                    code_system_original_text = code_system_original_text.text
+
+                code_system_display_name = code_element.get("displayName")
+
+            extracted_data[id_val] = {
+                'content': related_content,
+                'size': content_size,
+                'originalText': code_system_original_text,
+                'displayName': code_system_display_name
+            }
+
+    return extracted_data, total_doc_size
+
+if __name__ == "__main__":
+    filepath = r"C:\Users\mmatias\Desktop\EpicLargey.xml"  # Replace with the actual file path
+    extracted_data, total_doc_size = extract_specific_ids_and_sizes(filepath)
+
+    if extracted_data:
+        for id_val, data in extracted_data.items():
+            print(f"ID: {id_val}")
+            if data['originalText']:
+                print(f"  Original Text: {data['originalText']}")
+            if data['displayName']:
+                print(f"  Display Name: {data['displayName']}")
+            print(f"  Size: {data['size']} bytes")
+            print("-" * 20)
+
+        total_related_size = sum(data['size'] for data in extracted_data.values())
+        percentage = (total_related_size / total_doc_size) * 100 if total_doc_size else 0
+
+        print("\nSummary:")
+        print(f"Total Related Content Size: {total_related_size} bytes")
+        print(f"Total Document Size: {total_doc_size} bytes")
+        print(f"Percentage of Document: {percentage:.2f}%")
