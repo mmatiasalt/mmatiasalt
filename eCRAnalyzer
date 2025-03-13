@@ -1,0 +1,101 @@
+import xml.etree.ElementTree as ET
+import os
+
+def analyze_cda_sections_detailed(filepath):
+    """
+    Analyzes an HL7 CDA XML document, groups sections by parent template IDs,
+    includes child template IDs, provides a summary of section sizes, and
+    includes codesystem displayName.
+    """
+
+    if not os.path.exists(filepath):
+        print(f"Error: File '{filepath}' not found.")
+        return
+
+    try:
+        tree = ET.parse(filepath)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        print(f"Error parsing XML: {e}")
+        return
+
+    namespaces = {'cda': 'urn:hl7-org:v3'}
+    section_groups = {}
+    section_order = []  # Maintain order of sections
+
+    sections = root.findall(".//cda:section", namespaces)
+
+    for section in sections:
+        parent_template_ids = []
+        for template_id in section.findall("./cda:templateId", namespaces): #direct children
+            root_attr = template_id.get('root')
+            extension_attr = template_id.get('extension')
+            if root_attr:
+                template_id_str = root_attr
+                if extension_attr:
+                    template_id_str += f"^{extension_attr}"
+                parent_template_ids.append(template_id_str)
+
+        title_element = section.find("./cda:title", namespaces)
+        section_title = title_element.text if title_element is not None else "Untitled Section"
+
+        parent_template_tuple = tuple(parent_template_ids)
+
+        if parent_template_tuple not in section_groups:
+            section_groups[parent_template_tuple] = {
+                'title': section_title,
+                'children': {},
+                'content': "",
+                'order_index': len(section_order),
+                'code_display_names': {}
+            }
+            section_order.append(parent_template_tuple)
+
+        child_template_counts = {}
+        for child_template_id in section.findall(".//cda:templateId", namespaces): #all descendants
+            child_root_attr = child_template_id.get('root')
+            if child_root_attr:
+                if child_root_attr not in child_template_counts:
+                    child_template_counts[child_root_attr] = 0
+                child_template_counts[child_root_attr] += 1
+
+        section_groups[parent_template_tuple]['children'].update(child_template_counts)
+        section_groups[parent_template_tuple]['content'] += ET.tostring(section, encoding='unicode')
+
+        # Extract code and displayName
+        code_element = section.find("./cda:code", namespaces)
+        if code_element is not None:
+            code = code_element.get('code')
+            display_name = code_element.get('displayName')
+            if code and display_name:
+                section_groups[parent_template_tuple]['code_display_names'][code] = display_name
+
+    print("Section Analysis:")
+    for parent_template_tuple in section_order:
+        section_data = section_groups[parent_template_tuple]
+        print(f"\nSection: {section_data['title']}")
+        print("  Parent Template IDs:")
+        for parent_id in parent_template_tuple:
+            print(f"    - {parent_id}")
+
+        print("  Child Template ID Counts:")
+        for child_id, count in section_data['children'].items():
+            print(f"    - {child_id}: {count}")
+
+        print("  Code Display Names:")
+        for code, display_name in section_data['code_display_names'].items():
+            print(f"    - Code: {code}, Display Name: {display_name}")
+
+    print("\nSection Size Summary:")
+    for parent_template_tuple in section_order:
+        section_data = section_groups[parent_template_tuple]
+        content = section_data['content']
+        char_count = len(content)
+        line_count = content.count('\n') + 1
+        print(f"Section: {section_data['title']}")
+        print(f"  Character Count: {char_count}")
+        print(f"  Line Count: {line_count}")
+
+if __name__ == "__main__":
+    filepath = r"C:\Users\mmatias\Downloads\epic3.1_Example1"
+    analyze_cda_sections_detailed(filepath)
