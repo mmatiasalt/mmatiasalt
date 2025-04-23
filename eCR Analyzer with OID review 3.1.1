@@ -1,0 +1,285 @@
+import xml.etree.ElementTree as ET
+import os
+import pandas as pd
+import re # Keep for clean_oid
+
+# --- Configuration ---
+# Path to your CDA XML file
+xml_filepath = r"C:\Users\mmatias\Desktop\kareoTEST.xml"
+# Path to your Excel file containing OIDs and Titles TO READ FROM
+oid_lookup_excel_filepath = r"C:\Users\mmatias\Desktop\OID_Templates.xlsx"
+# Path for the NEW Excel file TO WRITE ANALYSIS RESULTS TO
+analysis_output_excel_filepath = r"C:\Users\mmatias\Desktop\Analysis_Output.xlsx" # Changed filename
+# Specify the column names in your OID lookup Excel file
+oid_column_name = 'OID'      # CHANGE if your OID column has a different name
+title_column_name = 'Title'  # CHANGE if your Title column has a different name
+# Static label to add for matched OIDs
+matched_oid_label = "eCR 3.1.1 Match"
+# Excel Sheet Name for Output
+output_sheet_name = "CDA Analysis"
+# --- End Configuration ---
+
+def clean_oid(oid_string):
+    """
+    Cleans an OID string by removing parts starting with '^' or ':'
+    and stripping whitespace.
+    """
+    if not isinstance(oid_string, str):
+        return ""
+
+    oid_string = oid_string.strip()
+    caret_pos = oid_string.find('^')
+    colon_pos = oid_string.find(':')
+    end_pos = -1
+    positions = [pos for pos in [caret_pos, colon_pos] if pos != -1]
+
+    if positions:
+        end_pos = min(positions)
+
+    if end_pos != -1:
+        return oid_string[:end_pos].strip()
+    else:
+        return oid_string
+
+def load_oid_titles(filepath, oid_col='OID', title_col='Title'):
+    """
+    Reads the OID-Title lookup Excel file.
+    """
+    oid_map = {}
+    if not os.path.exists(filepath):
+        print(f"Warning: OID Titles lookup file not found at '{filepath}'. Titles will not be displayed.")
+        return oid_map
+
+    print(f"Reading OID titles from: {filepath}")
+    try:
+        df = pd.read_excel(filepath)
+        # ... (rest of the function remains the same) ...
+        if oid_col not in df.columns:
+            print(f"Warning: OID column '{oid_col}' not found in '{filepath}'. Titles will not be displayed.")
+            return oid_map
+        if title_col not in df.columns:
+            print(f"Warning: Title column '{title_col}' not found in '{filepath}'. Titles will not be displayed.")
+            return oid_map
+
+        processed_oids = 0
+        for index, row in df.iterrows():
+            oid_raw = row[oid_col]
+            title = row[title_col]
+
+            if pd.notna(oid_raw):
+                oid_cleaned = clean_oid(str(oid_raw))
+                if oid_cleaned:
+                    if pd.notna(title):
+                        oid_map[oid_cleaned] = str(title).strip()
+                    else:
+                         oid_map[oid_cleaned] = "N/A"
+                    processed_oids += 1
+
+        print(f"Successfully loaded {processed_oids} OID-Title pairs from '{filepath}' (OIDs cleaned).")
+
+    except Exception as e:
+        print(f"Error reading OID Titles lookup file '{filepath}': {e}. Titles will not be displayed.")
+        return {}
+
+    return oid_map
+
+def analyze_cda_sections_to_data(xml_filepath, oid_title_map, matched_label):
+    """
+    Analyzes CDA sections and returns data structured for Excel output.
+    NO CONSOLE PRINTING OF ANALYSIS HERE.
+    """
+    if not os.path.exists(xml_filepath):
+        print(f"Error: XML File '{xml_filepath}' not found.")
+        return None # Return None on error
+
+    analysis_data = [] # List to hold row data (dictionaries)
+
+    try:
+        tree = ET.parse(xml_filepath)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        print(f"Error parsing XML: {e}")
+        return None
+    except Exception as e:
+         print(f"An unexpected error occurred opening or parsing the XML file: {e}")
+         return None
+
+    namespaces = {'cda': 'urn:hl7-org:v3'}
+    section_groups = {}
+    section_order = []
+
+    sections = root.findall(".//cda:section", namespaces)
+    if not sections:
+        print("No <section> elements found in the XML.")
+        return [] # Return empty list if no sections
+
+    print("Analyzing XML sections...")
+    # --- First Pass: Group sections and collect basic info ---
+    for section in sections:
+        parent_template_ids_cleaned = set()
+        for template_id in section.findall("./cda:templateId", namespaces):
+            root_attr = template_id.get('root')
+            if root_attr:
+                cleaned_id = clean_oid(root_attr)
+                if cleaned_id:
+                    parent_template_ids_cleaned.add(cleaned_id)
+
+        title_element = section.find("./cda:title", namespaces)
+        section_title = title_element.text.strip() if title_element is not None and title_element.text else "Untitled Section"
+        parent_template_tuple = tuple(sorted(list(parent_template_ids_cleaned)))
+
+        if not parent_template_tuple:
+             continue
+
+        if parent_template_tuple not in section_groups:
+            section_groups[parent_template_tuple] = {
+                'title': section_title, 'children': {}, 'content': "",
+                'code_display_names': {}, 'order_index': len(section_order)
+            }
+            section_order.append(parent_template_tuple)
+        elif section_groups[parent_template_tuple]['title'] == "Untitled Section" and section_title != "Untitled Section":
+             section_groups[parent_template_tuple]['title'] = section_title
+
+        # Collect Child Template IDs
+        child_template_counts = {}
+        processed_child_elements = {elem for elem in section.findall("./cda:templateId", namespaces)}
+        for child_template_id_element in section.findall(".//cda:templateId", namespaces):
+            if child_template_id_element in processed_child_elements: continue
+            child_root_attr = child_template_id_element.get('root')
+            if child_root_attr:
+                cleaned_child_oid = clean_oid(child_root_attr)
+                if cleaned_child_oid and cleaned_child_oid not in parent_template_ids_cleaned:
+                     child_template_counts[cleaned_child_oid] = child_template_counts.get(cleaned_child_oid, 0) + 1
+                     processed_child_elements.add(child_template_id_element)
+
+        for child_id, count in child_template_counts.items():
+            section_groups[parent_template_tuple]['children'][child_id] = section_groups[parent_template_tuple]['children'].get(child_id, 0) + count
+
+        # Append Content
+        try:
+            section_groups[parent_template_tuple]['content'] += ET.tostring(section, encoding='unicode', method='xml')
+        except Exception: # Ignore content errors for now, size might be off
+             section_groups[parent_template_tuple]['content'] += ""
+
+
+        # Extract Code/Display Name
+        code_element = section.find("./cda:code", namespaces)
+        if code_element is not None:
+            code = code_element.get('code')
+            display_name = code_element.get('displayName')
+            if code and display_name:
+                code_key = code.strip()
+                if code_key not in section_groups[parent_template_tuple]['code_display_names']:
+                     section_groups[parent_template_tuple]['code_display_names'][code_key] = display_name.strip()
+
+    print("Structuring data for Excel...")
+    # --- Second Pass: Structure data for output ---
+    for parent_template_tuple in section_order:
+        section_data = section_groups[parent_template_tuple]
+        group_title = section_data['title']
+        group_key_str = ', '.join(parent_template_tuple) if parent_template_tuple else 'N/A'
+
+        # Base dictionary for common info in this group
+        base_row = {
+            'Section Group Title': group_title,
+            'Parent OIDs (Group Key)': group_key_str,
+            'Detail Type': None, 'OID': None, 'Label (eCR)': None,
+            'Title (Lookup)': None, 'Count': None, 'Code': None,
+            'Code Display Name': None, 'Character Count (Group)': None,
+            'Line Count (Group)': None
+        }
+
+        # 1. Add rows for Parent OIDs
+        if parent_template_tuple:
+            for parent_id in parent_template_tuple:
+                row = base_row.copy()
+                row['Detail Type'] = 'Parent OID'
+                row['OID'] = parent_id
+                title = oid_title_map.get(parent_id, "")
+                if title:
+                    row['Label (eCR)'] = matched_label
+                    row['Title (Lookup)'] = title
+                analysis_data.append(row)
+        else:
+            # Optionally add a row indicating no parent OIDs if needed
+            # row = base_row.copy()
+            # row['Detail Type'] = 'Parent OID'
+            # row['OID'] = '(None Found)'
+            # analysis_data.append(row)
+            pass # Or just skip if no parent OIDs
+
+        # 2. Add rows for Child OIDs
+        if section_data['children']:
+            sorted_child_ids = sorted(section_data['children'].keys())
+            for child_id in sorted_child_ids:
+                row = base_row.copy()
+                row['Detail Type'] = 'Child OID'
+                row['OID'] = child_id
+                row['Count'] = section_data['children'][child_id]
+                title = oid_title_map.get(child_id, "")
+                if title:
+                    row['Label (eCR)'] = matched_label
+                    row['Title (Lookup)'] = title
+                analysis_data.append(row)
+
+        # 3. Add rows for Codes
+        if section_data['code_display_names']:
+             sorted_codes = sorted(section_data['code_display_names'].keys())
+             for code in sorted_codes:
+                 row = base_row.copy()
+                 row['Detail Type'] = 'Code'
+                 row['Code'] = code
+                 row['Code Display Name'] = section_data['code_display_names'][code]
+                 analysis_data.append(row)
+
+        # 4. Add row for Size Summary
+        content = section_data['content']
+        char_count = len(content)
+        line_count = len(content.splitlines())
+        row = base_row.copy()
+        row['Detail Type'] = 'Size Summary'
+        row['Character Count (Group)'] = char_count
+        row['Line Count (Group)'] = line_count
+        analysis_data.append(row)
+
+    print(f"Analysis complete. Prepared {len(analysis_data)} rows for Excel.")
+    return analysis_data
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    # 1. Load OID titles from the lookup Excel file
+    oid_titles = load_oid_titles(oid_lookup_excel_filepath, oid_column_name, title_column_name)
+
+    # 2. Run the analysis to get structured data (list of dictionaries)
+    analysis_results = analyze_cda_sections_to_data(xml_filepath, oid_titles, matched_oid_label)
+
+    # 3. Write the results to the new output Excel file
+    if analysis_results is not None: # Check if analysis returned data
+        if not analysis_results:
+             print("Analysis finished, but no data was generated to write to Excel.")
+        else:
+            print(f"Attempting to write analysis results to: {analysis_output_excel_filepath}")
+            try:
+                # Create DataFrame
+                df = pd.DataFrame(analysis_results)
+
+                # Define desired column order
+                column_order = [
+                    'Section Group Title', 'Parent OIDs (Group Key)', 'Detail Type',
+                    'OID', 'Label (eCR)', 'Title (Lookup)', 'Count', 'Code',
+                    'Code Display Name', 'Character Count (Group)', 'Line Count (Group)'
+                ]
+                # Reorder columns, adding any potentially missed columns at the end
+                df = df.reindex(columns=column_order, fill_value=None)
+
+                # Write to Excel
+                df.to_excel(analysis_output_excel_filepath, index=False, sheet_name=output_sheet_name)
+                print(f"Successfully saved analysis results to '{analysis_output_excel_filepath}' in sheet '{output_sheet_name}'.")
+
+            except PermissionError:
+                 print(f"\nError: Permission denied when trying to write to '{analysis_output_excel_filepath}'.")
+                 print("Please ensure the file is not open in Excel or another application and that you have write permissions.")
+            except Exception as e:
+                print(f"\nAn unexpected error occurred while writing to Excel: {e}")
+    else:
+        print("Analysis could not be completed due to errors.")
