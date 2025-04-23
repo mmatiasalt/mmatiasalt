@@ -1,0 +1,198 @@
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+import os
+import re # For sanitizing title
+
+# Define the primary HL7 v3 namespace
+HL7_NS = {'h': 'urn:hl7-org:v3'}
+
+def _build_path(parent_path, element, index=None):
+    """Helper function to build an XPath-like path for reporting."""
+    # Extract local name, removing namespace in curly braces if present
+    tag = element.tag.split('}')[-1]
+    path = f"{parent_path}/{tag}"
+    if index is not None:
+        # Use 1-based indexing for readability when multiple siblings have same tag
+        path += f"[{index + 1}]"
+    return path
+
+def _group_children_by_tag(element):
+    """Groups child elements by their tag name (including namespace)."""
+    children_by_tag = defaultdict(list)
+    for child in element:
+        # Ignore comments and processing instructions
+        if isinstance(child.tag, str):
+            children_by_tag[child.tag].append(child)
+    return children_by_tag
+
+def _sanitize_title(title_text):
+    """Basic sanitization for title text used in path."""
+    if not title_text:
+        return ""
+    # Remove leading/trailing whitespace, replace newlines with spaces
+    sanitized = title_text.strip().replace('\n', ' ')
+    # Remove potentially problematic characters for path display (adjust as needed)
+    sanitized = re.sub(r"['\"\[\]]", "", sanitized)
+    # Limit length if necessary
+    max_len = 50
+    if len(sanitized) > max_len:
+        sanitized = sanitized[:max_len-3] + "..."
+    return sanitized
+
+def compare_xml_recursive(elem1, elem2, path, differences, label1, label2):
+    """
+    Recursively compares the structure of two XML elements, focusing on
+    presence/absence of tags/attributes and adding section titles. Uses
+    custom labels in output messages.
+
+    Args:
+        elem1: Element from the first XML tree.
+        elem2: Element from the second XML tree.
+        path: The current path string for context.
+        differences: A list to store found difference descriptions.
+        label1: Custom label for the first XML (e.g., "Athena").
+        label2: Custom label for the second XML (e.g., "Epic").
+    """
+    # 1. Compare attributes (presence/absence of names)
+    attrs1 = set(elem1.attrib.keys())
+    attrs2 = set(elem2.attrib.keys())
+
+    if attrs1 != attrs2:
+        missing_in_2 = attrs1 - attrs2 # Attributes present in elem1 only
+        missing_in_1 = attrs2 - attrs1 # Attributes present in elem2 only
+        if missing_in_1:
+            differences.append(f"{path}: Attributes present only in '{label2}': {sorted(list(missing_in_1))}")
+        if missing_in_2:
+            differences.append(f"{path}: Attributes present only in '{label1}': {sorted(list(missing_in_2))}")
+
+    # 2. Compare children structure
+    children1_by_tag = _group_children_by_tag(elem1)
+    children2_by_tag = _group_children_by_tag(elem2)
+
+    tags1 = set(children1_by_tag.keys())
+    tags2 = set(children2_by_tag.keys())
+
+    # 2a. Find child tags present in one tree but not the other at this level
+    if tags1 != tags2:
+        missing_tags_in_2 = tags1 - tags2 # Tags present in elem1 only
+        missing_tags_in_1 = tags2 - tags1 # Tags present in elem2 only
+        if missing_tags_in_1:
+            # Extract local names for cleaner reporting
+            local_names = sorted([t.split('}')[-1] for t in missing_tags_in_1])
+            differences.append(f"{path}: Child tags present only in '{label2}': {local_names}")
+        if missing_tags_in_2:
+            local_names = sorted([t.split('}')[-1] for t in missing_tags_in_2])
+            differences.append(f"{path}: Child tags present only in '{label1}': {local_names}")
+
+    # 2b. Compare common child tags - only recurse if counts match
+    common_tags = tags1.intersection(tags2)
+    for tag in common_tags:
+        child_list1 = children1_by_tag[tag]
+        child_list2 = children2_by_tag[tag]
+        local_tag_name = tag.split('}')[-1] # Get local name
+
+        # --- Focus Change: Only compare structure within children if counts match ---
+        if len(child_list1) == len(child_list2):
+            # Counts match, proceed with pairwise recursion
+            for i in range(len(child_list1)):
+                child1 = child_list1[i]
+                child2 = child_list2[i]
+
+                # Build base path for the child
+                base_child_path = _build_path(path, child1, index=i if len(child_list1) > 1 else None)
+
+                # --- Add Section Title Logic ---
+                final_child_path = base_child_path
+                # Check if child1 is a section element (using namespace)
+                if child1.tag == '{urn:hl7-org:v3}section':
+                    # Attempt to find the title element using namespace
+                    title_elem = child1.find('./h:title', namespaces=HL7_NS)
+
+                    if title_elem is not None and title_elem.text:
+                        title_text = _sanitize_title(title_elem.text)
+                        if title_text:
+                            # Append title to the path segment
+                            final_child_path += f"[title='{title_text}']"
+                # --- End Section Title Logic ---
+
+                # Make the recursive call using the potentially modified path and labels
+                compare_xml_recursive(child1, child2, final_child_path, differences, label1, label2)
+        # else: Counts differ for this tag. We are no longer reporting this difference.
+        # The tag presence/absence check above already covers if the tag exists in one but not the other.
+
+
+def compare_xml_structure(file_path1, file_path2, label1, label2):
+    """
+    Parses two XML files and initiates the structural comparison using custom labels.
+
+    Args:
+        file_path1: Path to the first XML file.
+        file_path2: Path to the second XML file.
+        label1: Custom label for the first XML.
+        label2: Custom label for the second XML.
+
+    Returns:
+        A list of strings describing the structural differences found.
+        Returns a list with an error message if parsing fails.
+    """
+    if not os.path.exists(file_path1):
+        return [f"Error: File not found at {file_path1}"]
+    if not os.path.exists(file_path2):
+         return [f"Error: File not found at {file_path2}"]
+
+    differences = []
+    try:
+        tree1 = ET.parse(file_path1)
+        root1 = tree1.getroot()
+        print(f"Successfully parsed '{label1}' ({os.path.basename(file_path1)})")
+    except ET.ParseError as e:
+        return [f"Error parsing '{label1}' ({os.path.basename(file_path1)}): {e}"]
+    except Exception as e:
+        return [f"An unexpected error occurred reading '{label1}' ({os.path.basename(file_path1)}): {e}"]
+
+    try:
+        tree2 = ET.parse(file_path2)
+        root2 = tree2.getroot()
+        print(f"Successfully parsed '{label2}' ({os.path.basename(file_path2)})")
+    except ET.ParseError as e:
+        return [f"Error parsing '{label2}' ({os.path.basename(file_path2)}): {e}"]
+    except Exception as e:
+        return [f"An unexpected error occurred reading '{label2}' ({os.path.basename(file_path2)}): {e}"]
+
+
+    # Initial check: Compare root element tags
+    if root1.tag != root2.tag:
+        # Report difference in root tags but continue comparison if possible
+        differences.append(f"Root element tags differ: '{label1}' has '{root1.tag}', '{label2}' has '{root2.tag}'")
+
+    # Start recursive comparison from root elements
+    # Use local name of root for the initial path for readability
+    root_path = root1.tag.split('}')[-1] if '}' in root1.tag else root1.tag
+    compare_xml_recursive(root1, root2, root_path, differences, label1, label2)
+
+    return differences
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # **** Define File Paths and Custom Labels ****
+    file1_path = r"C:\Users\mmatias\Desktop\athenahospital.xml"
+    label1 = "Athena"
+
+    file2_path = r"C:\Users\mmatias\Desktop\EpicLargey.xml"
+    label2 = "Epic"
+
+    # Print mapping for clarity
+    print(f"\nComparing structure (excluding count differences) of:")
+    print(f"  '{label1}': {file1_path}")
+    print(f"  '{label2}': {file2_path}\n")
+
+    # Run comparison
+    structural_differences = compare_xml_structure(file1_path, file2_path, label1, label2)
+
+    # Print results
+    if not structural_differences:
+        print("No structural differences (presence/absence of tags/attributes) found.")
+    else:
+        print("Structural differences found:")
+        for diff in structural_differences:
+            print(f"- {diff}")
